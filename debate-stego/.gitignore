@@ -1,0 +1,26 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Secrets
+.env
+
+# Virtualenvs
+.venv/
+venv/
+
+# Run artifacts (keep the directory, ignore its contents)
+results/*.sqlite
+results/*.sqlite-journal
+results/*.jsonl
+results/*.csv
+results/*.png
+
+# Notebook checkpoints
+.ipynb_checkpoints/
+
+# The QuALITY dataset is large and not redistributed here.
+QuALITY.v1.0.1/

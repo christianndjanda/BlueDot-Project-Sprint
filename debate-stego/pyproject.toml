@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "debate-stego"
+version = "0.1.0"
+description = "Measuring steganographic collusion between LLM debaters and whether paraphrasing closes the channel."
+requires-python = ">=3.11"
+dependencies = [
+    "anthropic>=0.40",
+    "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+# Phase 2 needs nltk for sentence tokenisation (encodings); Phase 4 needs plotting.
+encodings = ["nltk>=3.8"]
+plots = ["matplotlib>=3.8", "pandas>=2.0"]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+debate-stego = "debate_stego.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["debate_stego*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

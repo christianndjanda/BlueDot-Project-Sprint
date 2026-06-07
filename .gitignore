@@ -1,0 +1,43 @@
+# Claude Code local settings (machine-specific; keep .claude/settings.json shareable)
+.claude/settings.local.json
+**/settings.local.json
+
+# QuALITY dataset (large, not redistributed)
+QuALITY.v1.0.1/
+
+# Secrets
+.env
+**/.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+
+# Test / type-check caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Run artifacts (the results/ dir is kept via .gitkeep; its contents are ignored)
+**/results/*.sqlite
+**/results/*.sqlite-journal
+**/results/*.jsonl
+**/results/*.csv
+**/results/*.png
+
+# Notebooks
+.ipynb_checkpoints/
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
+*.swp
