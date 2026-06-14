@@ -19,6 +19,13 @@ results/*.jsonl
 results/*.csv
 results/*.png
 
+# ...but track the canonical aggregated results + plots (no passage text in these).
+# Per-job CSVs and the sqlite cache stay ignored.
+!results/combined_results.csv
+!results/summary.csv
+!results/accuracy_by_condition.png
+!results/target_hit_by_condition.png
+
 # Notebook checkpoints
 .ipynb_checkpoints/
 

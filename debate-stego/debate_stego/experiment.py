@@ -15,9 +15,17 @@ Data flow per item (design doc Appendix C):
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from .interface import DebaterInput, DebateTranscript, QualityItem
+
+# Maps an item to the payload both debaters embed (None for honest conditions).
+PayloadFn = Callable[[QualityItem], "bytes | None"]
+
+
+def _no_payload(_item: QualityItem) -> bytes | None:
+    return None
 
 
 @dataclass
@@ -31,6 +39,7 @@ class ResultRow:
     parse_failed: bool
     condition: str
     encoding: str
+    paraphraser: str = "none"
 
     # Column order for the output CSV. The first four are the spec-required columns.
     FIELDS = [
@@ -43,6 +52,7 @@ class ResultRow:
         "parse_failed",
         "condition",
         "encoding",
+        "paraphraser",
     ]
 
     def as_dict(self) -> dict:
@@ -56,6 +66,7 @@ class ResultRow:
             "parse_failed": int(self.parse_failed),
             "condition": self.condition,
             "encoding": self.encoding,
+            "paraphraser": self.paraphraser,
         }
 
 
@@ -68,11 +79,15 @@ async def _run_item(
     *,
     condition: str,
     encoding: str,
+    paraphraser_name: str,
+    payload_fn: PayloadFn,
 ) -> ResultRow:
-    arg_a, arg_b = await asyncio.gather(
-        debater_a.aargue(DebaterInput(item, item.correct_index, None)),
-        debater_b.aargue(DebaterInput(item, item.target_wrong_index, None)),
-    )
+    payload = payload_fn(item)  # both debaters embed the same target payload
+    # Sequential (not gathered): debater A writes the shared passage to the prompt
+    # cache, then debater B re-reads it. Concurrent identical-prefix calls would each
+    # pay the full cache-write cost. Items still run concurrently in run_condition_async.
+    arg_a = await debater_a.aargue(DebaterInput(item, item.correct_index, payload))
+    arg_b = await debater_b.aargue(DebaterInput(item, item.target_wrong_index, payload))
 
     arguments = ["", "", "", ""]
     arguments[item.correct_index] = arg_a
@@ -99,6 +114,7 @@ async def _run_item(
         parse_failed=parse_failed,
         condition=condition,
         encoding=encoding,
+        paraphraser=paraphraser_name,
     )
 
 
@@ -111,11 +127,14 @@ async def run_condition_async(
     *,
     condition: str,
     encoding: str = "none",
+    paraphraser_name: str = "none",
+    payload_fn: PayloadFn = _no_payload,
 ) -> list[ResultRow]:
     tasks = [
         _run_item(
             item, debater_a, debater_b, paraphraser, judge,
             condition=condition, encoding=encoding,
+            paraphraser_name=paraphraser_name, payload_fn=payload_fn,
         )
         for item in items
     ]
@@ -131,11 +150,14 @@ def run_condition(
     *,
     condition: str,
     encoding: str = "none",
+    paraphraser_name: str = "none",
+    payload_fn: PayloadFn = _no_payload,
 ) -> list[ResultRow]:
     return asyncio.run(
         run_condition_async(
             items, debater_a, debater_b, paraphraser, judge,
             condition=condition, encoding=encoding,
+            paraphraser_name=paraphraser_name, payload_fn=payload_fn,
         )
     )
 

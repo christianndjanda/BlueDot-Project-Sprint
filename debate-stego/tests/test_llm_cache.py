@@ -8,15 +8,24 @@ import json
 from debate_stego.llm import LLMClient
 
 
+def _usage(in_tok=10, out_tok=5, creation=0, read=0):
+    return {
+        "input_tokens": in_tok,
+        "output_tokens": out_tok,
+        "cache_creation_input_tokens": creation,
+        "cache_read_input_tokens": read,
+    }
+
+
 def _make_client(tmp_path, counter):
     llm = LLMClient(
         cache_path=tmp_path / "cache.sqlite",
         usage_path=tmp_path / "usage.jsonl",
     )
 
-    def fake_sync(model, system, user, temperature, max_tokens):
+    def fake_sync(model, system, user, temperature, max_tokens, cache_system=False):
         counter["calls"] += 1
-        return (f"resp:{model}:{user}", 10, 5)
+        return (f"resp:{model}:{user}", _usage())
 
     llm._call_api_sync = fake_sync  # type: ignore[method-assign]
     return llm
@@ -81,13 +90,32 @@ def test_persistence_across_instances(tmp_path):
         llm2.close()
 
 
+def test_acomplete_survives_multiple_event_loops(tmp_path):
+    # Each run_condition() uses its own asyncio.run(); the loop-bound semaphore/lock
+    # must be rebound per loop or the 2nd job crashes ("different event loop").
+    counter = {"calls": 0}
+    llm = LLMClient(cache_path=tmp_path / "c.sqlite", usage_path=tmp_path / "u.jsonl")
+
+    async def fake_async(model, system, user, temperature, max_tokens, cache_system=False):
+        counter["calls"] += 1
+        return (f"r:{user}", _usage(5, 1))
+
+    llm._call_api_async = fake_async  # type: ignore[method-assign]
+    try:
+        asyncio.run(llm.acomplete("m", "s", "u1", temperature=0.0, max_tokens=8))
+        asyncio.run(llm.acomplete("m", "s", "u2", temperature=0.0, max_tokens=8))
+        assert counter["calls"] == 2
+    finally:
+        llm.close()
+
+
 def test_async_cache_hit(tmp_path):
     counter = {"calls": 0}
     llm = LLMClient(cache_path=tmp_path / "c.sqlite", usage_path=tmp_path / "u.jsonl")
 
-    async def fake_async(model, system, user, temperature, max_tokens):
+    async def fake_async(model, system, user, temperature, max_tokens, cache_system=False):
         counter["calls"] += 1
-        return (f"resp:{user}", 7, 3)
+        return (f"resp:{user}", _usage(7, 3))
 
     llm._call_api_async = fake_async  # type: ignore[method-assign]
 

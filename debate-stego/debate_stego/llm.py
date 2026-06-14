@@ -83,12 +83,16 @@ class LLMClient:
 
         self._client: anthropic.Anthropic | None = None
         self._aclient: anthropic.AsyncAnthropic | None = None
-        self._sem = None  # created on first async use, bound to the running loop
+        # asyncio primitives are loop-bound; re-created whenever the running loop
+        # changes (each run_condition() spins up a fresh loop via asyncio.run).
+        self._sem = None
+        self._rate_lock = None
+        self._primitives_loop = None
 
         # Rolling 60s window of (monotonic_ts, reserved_input_tokens) for the throttle.
+        # Persists across jobs/loops so the TPM cap holds over a whole multi-job run.
         self._rate_window: deque[tuple[float, int]] = deque()
         self._rate_used = 0
-        self._rate_lock = None  # asyncio.Lock, created on first async use
 
         # In-memory running totals for the end-of-run cost estimate.
         self.usage_totals: dict[str, dict[str, int]] = {}
@@ -126,50 +130,89 @@ class LLMClient:
             )
             self._conn.commit()
 
-    def _log_usage(self, model: str, input_tokens: int, output_tokens: int) -> None:
-        record = {
-            "ts": time.time(),
-            "model": model,
-            "input_tokens": input_tokens,
-            "output_tokens": output_tokens,
-        }
+    _USAGE_KEYS = (
+        "input_tokens",
+        "output_tokens",
+        "cache_creation_input_tokens",
+        "cache_read_input_tokens",
+    )
+
+    def _log_usage(self, model: str, usage: dict[str, int]) -> None:
+        record = {"ts": time.time(), "model": model, **usage}
         with self._lock:
             with self.usage_path.open("a", encoding="utf-8") as fh:
                 fh.write(json.dumps(record) + "\n")
             totals = self.usage_totals.setdefault(
-                model, {"input_tokens": 0, "output_tokens": 0}
+                model, {k: 0 for k in self._USAGE_KEYS}
             )
-            totals["input_tokens"] += input_tokens
-            totals["output_tokens"] += output_tokens
+            for k in self._USAGE_KEYS:
+                totals[k] += usage.get(k, 0)
             self.api_calls += 1
+
+    @staticmethod
+    def _build_system(system: str, cache_system: bool):
+        # When cache_system is set, send the system prompt as a single cacheable block
+        # so a shared prefix (e.g. the passage) is written once and re-read by later
+        # calls with the same system. Otherwise send a plain string.
+        if cache_system:
+            return [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}]
+        return system
+
+    @staticmethod
+    def _usage_dict(message) -> dict[str, int]:
+        u = message.usage
+        return {
+            "input_tokens": u.input_tokens,
+            "output_tokens": u.output_tokens,
+            "cache_creation_input_tokens": getattr(u, "cache_creation_input_tokens", 0) or 0,
+            "cache_read_input_tokens": getattr(u, "cache_read_input_tokens", 0) or 0,
+        }
 
     # -- API call seams (monkeypatched in tests) ---------------------------
 
     def _call_api_sync(
-        self, model: str, system: str, user: str, temperature: float, max_tokens: int
-    ) -> tuple[str, int, int]:
+        self, model: str, system: str, user: str, temperature: float,
+        max_tokens: int, cache_system: bool = False,
+    ) -> tuple[str, dict[str, int]]:
         message = self.client.messages.create(
             model=model,
             max_tokens=max_tokens,
             temperature=temperature,
-            system=system,
+            system=self._build_system(system, cache_system),
             messages=[{"role": "user", "content": user}],
         )
-        return _extract_text(message), message.usage.input_tokens, message.usage.output_tokens
+        return _extract_text(message), self._usage_dict(message)
 
     async def _call_api_async(
-        self, model: str, system: str, user: str, temperature: float, max_tokens: int
-    ) -> tuple[str, int, int]:
+        self, model: str, system: str, user: str, temperature: float,
+        max_tokens: int, cache_system: bool = False,
+    ) -> tuple[str, dict[str, int]]:
         message = await self.aclient.messages.create(
             model=model,
             max_tokens=max_tokens,
             temperature=temperature,
-            system=system,
+            system=self._build_system(system, cache_system),
             messages=[{"role": "user", "content": user}],
         )
-        return _extract_text(message), message.usage.input_tokens, message.usage.output_tokens
+        return _extract_text(message), self._usage_dict(message)
 
     # -- rate throttle -----------------------------------------------------
+
+    def _ensure_loop_primitives(self) -> None:
+        """(Re)create the loop-bound semaphore/lock if the running loop changed.
+
+        asyncio.Semaphore/Lock bind to the loop they're first used in; reusing them
+        under a later asyncio.run() raises "bound to a different event loop". Each
+        run_condition() is its own asyncio.run, so we rebind per loop. The rate
+        *window* is not loop-bound and is left intact so the TPM cap spans jobs.
+        """
+        import asyncio
+
+        loop = asyncio.get_running_loop()
+        if self._primitives_loop is not loop:
+            self._sem = asyncio.Semaphore(self.max_concurrency)
+            self._rate_lock = asyncio.Lock()
+            self._primitives_loop = loop
 
     @staticmethod
     def _estimate_input_tokens(system: str, user: str) -> int:
@@ -187,8 +230,6 @@ class LLMClient:
         """
         import asyncio
 
-        if self._rate_lock is None:
-            self._rate_lock = asyncio.Lock()
         budget = self.input_tpm_limit * 0.9  # headroom for estimate error
         async with self._rate_lock:
             while True:
@@ -212,6 +253,7 @@ class LLMClient:
         *,
         temperature: float = 1.0,
         max_tokens: int = 1024,
+        cache_system: bool = False,
     ) -> str:
         key = _cache_key(model, system, user, temperature, max_tokens)
         cached = self._cache_get(key)
@@ -220,10 +262,10 @@ class LLMClient:
                 self.cache_hits += 1
             return cached
 
-        text, in_tok, out_tok = self._call_api_sync(
-            model, system, user, temperature, max_tokens
+        text, usage = self._call_api_sync(
+            model, system, user, temperature, max_tokens, cache_system
         )
-        self._log_usage(model, in_tok, out_tok)
+        self._log_usage(model, usage)
         self._cache_put(key, text)
         return text
 
@@ -235,11 +277,9 @@ class LLMClient:
         *,
         temperature: float = 1.0,
         max_tokens: int = 1024,
+        cache_system: bool = False,
     ) -> str:
-        import asyncio
-
-        if self._sem is None:
-            self._sem = asyncio.Semaphore(self.max_concurrency)
+        self._ensure_loop_primitives()
 
         key = _cache_key(model, system, user, temperature, max_tokens)
         cached = self._cache_get(key)
@@ -250,10 +290,10 @@ class LLMClient:
 
         await self._throttle(self._estimate_input_tokens(system, user))
         async with self._sem:
-            text, in_tok, out_tok = await self._call_api_async(
-                model, system, user, temperature, max_tokens
+            text, usage = await self._call_api_async(
+                model, system, user, temperature, max_tokens, cache_system
             )
-        self._log_usage(model, in_tok, out_tok)
+        self._log_usage(model, usage)
         self._cache_put(key, text)
         return text
 
@@ -273,9 +313,18 @@ class LLMClient:
         total = 0.0
         for model, totals in self.usage_totals.items():
             in_price, out_price = PRICES_PER_MTOK.get(model, (0.0, 0.0))
-            total += totals["input_tokens"] / 1e6 * in_price
-            total += totals["output_tokens"] / 1e6 * out_price
+            # Uncached input at full price; cache writes ~1.25x; cache reads ~0.1x.
+            total += totals.get("input_tokens", 0) / 1e6 * in_price
+            total += totals.get("cache_creation_input_tokens", 0) / 1e6 * in_price * 1.25
+            total += totals.get("cache_read_input_tokens", 0) / 1e6 * in_price * 0.1
+            total += totals.get("output_tokens", 0) / 1e6 * out_price
         return total
+
+    def cache_token_totals(self) -> tuple[int, int]:
+        """(cache_creation, cache_read) input tokens across all models."""
+        created = sum(t.get("cache_creation_input_tokens", 0) for t in self.usage_totals.values())
+        read = sum(t.get("cache_read_input_tokens", 0) for t in self.usage_totals.values())
+        return created, read
 
     def close(self) -> None:
         with self._lock:
